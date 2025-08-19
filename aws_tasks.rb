@@ -1,3 +1,4 @@
+#!/usr/bin/env ruby -rpry
 # frozen_string_literal: true
 
 require 'aws-sdk-ec2'
@@ -23,6 +24,7 @@ class AwsTasks
     @client = Aws::EC2::Client.new(**options)
     @ec2_resource = Aws::EC2::Resource.new(client: @client)
     @ce = Aws::CostExplorer::Client.new(**options)
+    puts "Using AWS region: #{@client.config.region}" if @client.config.region
   end
 
   # Filters the response based on the provided tags.
@@ -171,117 +173,174 @@ class AwsTasks
   end
 end
 
-# Wraps Amazon S3 object actions.
-class ObjectUploadFileWrapper
-  attr_reader :object
-
-  # @param object [Aws::S3::Object] An existing Amazon S3 object.
-  def initialize(object)
-    @object = object
-  end
-
-  # Uploads a file to an Amazon S3 object by using a managed uploader.
-  #
-  # @param file_path [String] The path to the file to upload.
-  # @return [Boolean] True when the file is uploaded; otherwise false.
-  def upload_file(file_path)
-    @object.upload_file(file_path)
-    true
-  rescue Aws::Errors::ServiceError => e
-    puts "Couldn't upload file #{file_path} to #{@object.key}. Here's why: #{e.message}"
-    false
-  end
-end
-
-def size_human_readable(size_bytes)
-  if size_bytes < 1024
-    "#{size_bytes} B"
-  elsif size_bytes < 1024 * 1024
-    "#{(size_bytes / 1024.0).round(1)} KB"
-  elsif size_bytes < 1024 * 1024 * 1024
-    "#{(size_bytes / 1024.0 / 1024.0).round(2)} MB"
-  else
-    "#{(size_bytes / 1024.0 / 1024.0 / 1024.0).round(3)} GB"
-  end
-end
-
-def calculate_file_etag(file_path)
-  return 'NoETag' unless File.exist?(file_path)
-
-  # Calculate the ETag for the file
-  digest = Digest::MD5.file(file_path).hexdigest
-  "\"#{digest}\""
-rescue StandardError => e
-  "LocalETagError: #{e.message}"
-end
-
 # Wraps Amazon S3 bucket actions.
-class BucketListObjectsWrapper
-  attr_reader :bucket
+class AwsStorage
+  # @!visibility private
+  # @return [String] The name of the S3 bucket.
+  # @return [Aws::S3::Client] The AWS S3 client used for API calls.
+  attr_reader :bucket_name, :client, :bucket
 
-  # @param bucket [Aws::S3::Bucket] An existing Amazon S3 bucket.
-  def initialize(bucket)
-    @bucket = bucket
-  end
-
-  # Lists object in a bucket.
+  # Initializes the AwsStorage instance with the specified bucket name and options.
   #
-  # @param glob_pattern [String, nil] A glob pattern to filter object keys (S3 paths).
-  # @param max_objects [Integer] The maximum number of objects to list (default: 100).
-  # @return number of objects listed.
-  def list_objects(glob_pattern = nil, max_objects = 100, local_etag: false)
-    objs = @bucket.objects.select { |obj| glob_pattern.nil? || File.fnmatch(glob_pattern, obj.key, File::FNM_EXTGLOB) }
-                  .take(max_objects)
-                  .map do |obj|
-      {
-        name: obj.key,
-        size: obj.size,
-        modified: obj.last_modified,
-        etag: obj.etag || 'NoETag',
-        local_etag: if local_etag
-                      if obj.etag =~ /.*-\d+/
-                        'Multipart'
-                      else
-                        calculate_file_etag(obj.key) == obj.etag ? 'Match' : 'NoMatch'
-                      end
-                    else
-                      'NotChecked'
-                    end
-      }
+  # @param bucket_name [String] The name of the S3 bucket.
+  # @param options [Hash] Additional options for the AWS S3 client (region,credentials, etc.)
+  def initialize(bucket_name, **options)
+    @bucket_name = bucket_name
+    @client = Aws::S3::Client.new(**options)
+    puts "Using AWS region: #{@client.config.region}" if @client.config.region
+    select_bucket(bucket_name)
+  end
+
+  def select_bucket(bucket_name)
+    @bucket_name = bucket_name
+    begin
+      # Check if the bucket exists
+      @client.head_bucket(bucket: @bucket_name)
+      puts "Bucket '#{@bucket_name}' exists."
+      @bucket = Aws::S3::Bucket.new(@bucket_name, client: @client)
+    rescue Aws::S3::Errors::NotFound
+      puts "Bucket '#{@bucket_name}' does not exist."
+    rescue Aws::S3::Errors::Forbidden
+      puts "Bucket '#{@bucket_name}' exists but you don't have access to it."
+    rescue Aws::S3::Errors::Http301Error => e
+      puts "Bucket '#{@bucket_name}' exists but is not in the expected region. #{e.data.region ? "Expected region: #{e.data.region}" : 'Unknown'}"
+    rescue StandardError => e
+      puts "An error occurred: #{e.message}"
     end
-    puts Hirb::Helpers::Table.render(
-      objs,
-      fields: %i[name size modified etag local_etag],
-      filters: { size: ->(size) { size_human_readable(size) } }
-    )
-    objs.size
-  rescue Aws::Errors::ServiceError => e
-    puts "Couldn't list objects in bucket #{bucket.name}. Here's why: #{e.message}"
-    0
-  end
-end
-
-def s3_upload(bucket_name, file_path)
-  full_file_path = File.expand_path(file_path)
-  object_key = Pathname.new(full_file_path).relative_path_from(Pathname.pwd).to_s
-  bucket = Aws::S3::Bucket.new(bucket_name)
-  curr_obj = bucket.object(object_key)
-  if curr_obj.exists? && curr_obj.size == File.size(full_file_path) && curr_obj.etag !~ /.*-\d+/ && curr_obj.etag == calculate_file_etag(full_file_path)
-    puts "File #{file_path} is already up-to-date."
-    return
   end
 
-  object = Aws::S3::Object.new(bucket_name, object_key)
-  wrapper = ObjectUploadFileWrapper.new(object)
-  return unless wrapper.upload_file(full_file_path)
+  def self.size_human_readable(size_bytes)
+    if size_bytes < 1024
+      "#{size_bytes} B"
+    elsif size_bytes < 1024 * 1024
+      "#{(size_bytes / 1024.0).round(1)} KB"
+    elsif size_bytes < 1024 * 1024 * 1024
+      "#{(size_bytes / 1024.0 / 1024.0).round(2)} MB"
+    else
+      "#{(size_bytes / 1024.0 / 1024.0 / 1024.0).round(3)} GB"
+    end
+  end
 
-  puts "File #{file_path} successfully uploaded to #{bucket_name}:#{object_key}."
-end
+  def self.calculate_file_etag(file_path)
+    return 'NoETag' unless File.exist?(file_path)
 
-def s3_list(bucket_name, glob_pattern = nil, max_objects = 100, local_etag: false)
-  bucket = Aws::S3::Bucket.new(bucket_name)
-  wrapper = BucketListObjectsWrapper.new(bucket)
-  wrapper.list_objects(glob_pattern, max_objects, local_etag: local_etag)
+    # Calculate the ETag for the file
+    digest = Digest::MD5.file(file_path).hexdigest
+    "\"#{digest}\""
+  rescue StandardError => e
+    "LocalETagError: #{e.message}"
+  end
+
+  # uploads helper class for S3 object
+  class ObjectUploadFileWrapper
+    attr_reader :object
+
+    # @param object [Aws::S3::Object] An existing Amazon S3 object.
+    def initialize(object)
+      @object = object
+    end
+
+    # Uploads a file to an Amazon S3 object by using a managed uploader.
+    #
+    # @param file_path [String] The path to the file to upload.
+    # @return [Boolean] True when the file is uploaded; otherwise false.
+    def upload_file(file_path)
+      @object.upload_file(file_path)
+      true
+    rescue Aws::Errors::ServiceError => e
+      puts "Couldn't upload file #{file_path} to #{@object.key}. Here's why: #{e.message}"
+      false
+    end
+  end
+
+  # Bucket List Helper
+  class BucketListObjectsWrapper
+    attr_reader :bucket
+
+    # @param bucket [Aws::S3::Bucket] An existing Amazon S3 bucket.
+    def initialize(bucket)
+      @bucket = bucket
+    end
+
+    # Lists object in a bucket.
+    #
+    # @param glob_pattern [String, nil] A glob pattern to filter object keys (S3 paths).
+    # @param max_objects [Integer] The maximum number of objects to list (default: 100).
+    # @return number of objects listed.
+    def list_objects(glob_pattern = nil, max_objects = 100, local_etag: false)
+      objs = @bucket.objects.select { |obj| glob_pattern.nil? || File.fnmatch(glob_pattern, obj.key, File::FNM_EXTGLOB) }
+                    .take(max_objects)
+                    .map do |obj|
+        {
+          name: obj.key,
+          size: obj.size,
+          modified: obj.last_modified,
+          etag: obj.etag || 'NoETag',
+          local_etag: if local_etag
+                        if obj.etag =~ /.*-\d+/
+                          'Multipart'
+                        else
+                          AwsStorage.calculate_file_etag(obj.key) == obj.etag ? 'Match' : 'NoMatch'
+                        end
+                      else
+                        'NotChecked'
+                      end
+        }
+      end
+      puts Hirb::Helpers::Table.render(
+        objs,
+        fields: %i[name size modified etag local_etag],
+        filters: { size: ->(size) { AwsStorage.size_human_readable(size) } }
+      )
+      objs.size
+    rescue Aws::Errors::ServiceError => e
+      puts "Couldn't list objects in bucket #{bucket.name}. Here's why: #{e.message}"
+      0
+    end
+  end
+
+  def upload(file_path)
+    full_file_path = File.expand_path(file_path)
+    object_key = Pathname.new(full_file_path).relative_path_from(Pathname.pwd).to_s
+    curr_obj = @bucket.object(object_key)
+    if curr_obj.exists? && curr_obj.size == File.size(full_file_path) && curr_obj.etag !~ /.*-\d+/ && curr_obj.etag == AwsStorage.calculate_file_etag(full_file_path)
+      puts "File #{file_path} is already up-to-date."
+      return
+    end
+
+    object = Aws::S3::Object.new(@bucket_name, object_key, client: @client)
+    wrapper = ObjectUploadFileWrapper.new(object)
+    return unless wrapper.upload_file(full_file_path)
+
+    puts "File #{file_path} successfully uploaded to #{@bucket_name}:#{object_key}."
+  end
+
+  def list(glob_pattern = nil, max_objects = 100, local_etag: false)
+    return unless @bucket
+
+    wrapper = BucketListObjectsWrapper.new(@bucket)
+    wrapper.list_objects(glob_pattern, max_objects, local_etag: local_etag)
+  end
+
+  def delete(name)
+    @client.delete_object(bucket: @bucket_name, key: name)
+  end
+
+  def delete_many(glob_pattern)
+    return unless @bucket
+
+    objs = @bucket.objects.select { |obj| glob_pattern.nil? || File.fnmatch(glob_pattern, obj.key, File::FNM_EXTGLOB) }
+    objs.each do |obj|
+      print "Are you sure you want to delete #{obj.key}? (y/N) "
+      confirmation = gets.chomp
+      if confirmation.downcase == 'y'
+        @client.delete_object(bucket: @bucket_name, key: obj.key)
+        puts "#{obj.key} has been deleted."
+      else
+        puts "#{obj.key} was not deleted."
+      end
+    end
+  end
 end
 
 # if run with pry: `ruby -rpry script`
