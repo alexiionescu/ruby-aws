@@ -5,6 +5,7 @@ require 'aws-sdk-costexplorer'
 require 'aws-sdk-s3'
 require 'json'
 require 'hirb'
+require 'pathname'
 Hirb.enable
 
 # This class provides methods to interact with AWS EC2 instances and volumes.
@@ -168,6 +169,119 @@ class AwsTasks
       fields: %i[date usage_type cost]
     )
   end
+end
+
+# Wraps Amazon S3 object actions.
+class ObjectUploadFileWrapper
+  attr_reader :object
+
+  # @param object [Aws::S3::Object] An existing Amazon S3 object.
+  def initialize(object)
+    @object = object
+  end
+
+  # Uploads a file to an Amazon S3 object by using a managed uploader.
+  #
+  # @param file_path [String] The path to the file to upload.
+  # @return [Boolean] True when the file is uploaded; otherwise false.
+  def upload_file(file_path)
+    @object.upload_file(file_path)
+    true
+  rescue Aws::Errors::ServiceError => e
+    puts "Couldn't upload file #{file_path} to #{@object.key}. Here's why: #{e.message}"
+    false
+  end
+end
+
+def size_human_readable(size_bytes)
+  if size_bytes < 1024
+    "#{size_bytes} B"
+  elsif size_bytes < 1024 * 1024
+    "#{(size_bytes / 1024.0).round(1)} KB"
+  elsif size_bytes < 1024 * 1024 * 1024
+    "#{(size_bytes / 1024.0 / 1024.0).round(2)} MB"
+  else
+    "#{(size_bytes / 1024.0 / 1024.0 / 1024.0).round(3)} GB"
+  end
+end
+
+def calculate_file_etag(file_path)
+  return 'NoETag' unless File.exist?(file_path)
+
+  # Calculate the ETag for the file
+  digest = Digest::MD5.file(file_path).hexdigest
+  "\"#{digest}\""
+rescue StandardError => e
+  "LocalETagError: #{e.message}"
+end
+
+# Wraps Amazon S3 bucket actions.
+class BucketListObjectsWrapper
+  attr_reader :bucket
+
+  # @param bucket [Aws::S3::Bucket] An existing Amazon S3 bucket.
+  def initialize(bucket)
+    @bucket = bucket
+  end
+
+  # Lists object in a bucket.
+  #
+  # @param glob_pattern [String, nil] A glob pattern to filter object keys (S3 paths).
+  # @param max_objects [Integer] The maximum number of objects to list (default: 100).
+  # @return number of objects listed.
+  def list_objects(glob_pattern = nil, max_objects = 100, local_etag: false)
+    objs = @bucket.objects.select { |obj| glob_pattern.nil? || File.fnmatch(glob_pattern, obj.key, File::FNM_EXTGLOB) }
+                  .take(max_objects)
+                  .map do |obj|
+      {
+        name: obj.key,
+        size: obj.size,
+        modified: obj.last_modified,
+        etag: obj.etag || 'NoETag',
+        local_etag: if local_etag
+                      if obj.etag =~ /.*-\d+/
+                        'Multipart'
+                      else
+                        calculate_file_etag(obj.key) == obj.etag ? 'Match' : 'NoMatch'
+                      end
+                    else
+                      'NotChecked'
+                    end
+      }
+    end
+    puts Hirb::Helpers::Table.render(
+      objs,
+      fields: %i[name size modified etag local_etag],
+      filters: { size: ->(size) { size_human_readable(size) } }
+    )
+    objs.size
+  rescue Aws::Errors::ServiceError => e
+    puts "Couldn't list objects in bucket #{bucket.name}. Here's why: #{e.message}"
+    0
+  end
+end
+
+def s3_upload(bucket_name, file_path)
+  full_file_path = File.expand_path(file_path)
+  object_key = Pathname.new(full_file_path).relative_path_from(Pathname.pwd).to_s
+  bucket = Aws::S3::Bucket.new(bucket_name)
+  curr_obj = bucket.object(object_key)
+  if curr_obj.exists? && curr_obj.size == File.size(full_file_path) && curr_obj.etag !~ /.*-\d+/ && curr_obj.etag == calculate_file_etag(full_file_path)
+    puts "File #{file_path} is already up-to-date."
+    return
+  end
+
+  object = Aws::S3::Object.new(bucket_name, object_key)
+  wrapper = ObjectUploadFileWrapper.new(object)
+  return unless wrapper.upload_file(full_file_path)
+
+  puts "File #{file_path} successfully uploaded to #{bucket_name}:#{object_key}."
+end
+
+def s3_list(bucket_name, glob_pattern = nil, max_objects = 100, local_etag: false)
+  bucket = Aws::S3::Bucket.new(bucket_name)
+  wrapper = BucketListObjectsWrapper.new(bucket)
+  wrapper.list_objects(glob_pattern, max_objects, local_etag: local_etag)
 end
 
 # if run with pry: `ruby -rpry script`
