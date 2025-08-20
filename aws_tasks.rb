@@ -10,6 +10,8 @@ require 'pathname'
 require 'optparse'
 Hirb.enable
 
+VALID_VOLUME_TYPES = %w[standard gp2 gp3 io1 io2 st1 sc1].freeze
+
 # This class provides methods to interact with AWS EC2 instances and volumes.
 # It uses the AWS SDK for Ruby to perform operations like listing instances,
 # listing volumes, and modifying volume attributes.
@@ -39,7 +41,7 @@ class AwsTasks
       instance.tags.any? do |tag|
         tags.any? do |k, v|
           k.to_s.casecmp(tag.key.to_s).zero? && (
-            v.is_a?(Array) ? v.include?(tag.value) : tag.value == v.to_s
+            v.is_a?(Array) ? v.any? { |val| /#{val}/ =~ tag.value } : /#{v}/ =~ tag.value
           )
         end
       end
@@ -420,7 +422,7 @@ def run_with_args(args)
   }
   command = args[0]
   valid_command = %w[s3 ec2 cost].include?(command)
-  OptionParser.new(args[1..]) do |opts| # rubocop:disable Metrics/BlockLength
+  parser = OptionParser.new do |opts| # rubocop:disable Metrics/BlockLength
     opts.banner = 'Usage: aws_tasks.rb [command] [options]'
     opts.separator 'Commands: s3 | ec2 | cost' unless valid_command
 
@@ -450,8 +452,19 @@ def run_with_args(args)
         options[:delete] = file
       end
     when 'ec2'
-      opts.on('-n', '--names a,b,c', Array, 'Specify EC2 instance names') do |names|
+      opts.on('-n', '--names a,b,c', Array, 'Specify EC2 `Name` tags for filtering lists') do |names|
         options[:tags].merge!({ Name: names.map(&:strip) })
+      end
+      opts.on('--volumes', 'List EC2 volumes') do
+        options[:volumes] = true
+      end
+      opts.on('--volume-type VOLUME_TYPE', "Specify the volume type: #{VALID_VOLUME_TYPES.join(', ')}") do |volume_type|
+        raise OptionParser::InvalidArgument, "Invalid volume type: #{volume_type}. Valid options are: #{VALID_VOLUME_TYPES.join(', ')}" unless VALID_VOLUME_TYPES.include?(volume_type)
+
+        options[:volume_type] = volume_type
+      end
+      opts.on('--iops IOPS', Integer, 'Specify the IOPS for the volume') do |iops|
+        options[:iops] = iops
       end
       opts.on('--start', 'Start EC2 instances') do
         options[:start] = true
@@ -462,7 +475,7 @@ def run_with_args(args)
     end
 
     if valid_command
-      opts.on('-r', '--region REGION', 'AWS region to use (default is env var AWS_REGION or ~/.aws/config settings)') do |region|
+      opts.on('--region REGION', 'AWS region to use (default is env var AWS_REGION or ~/.aws/config settings)') do |region|
         options[:region] = region
       end
       opts.on('--dry-run', 'Perform a dry run (no changes will be made)') do
@@ -473,7 +486,13 @@ def run_with_args(args)
       puts opts
       exit
     end
-  end.parse!(args)
+  end
+  begin
+    parser.parse!(args[1..])
+  rescue StandardError => e
+    puts e.message
+    exit 1
+  end
 
   return unless valid_command
 
@@ -504,13 +523,20 @@ def run_with_args(args)
           else
             AwsTasks.new
           end
-    if options[:tags].empty?
-      aws.list_instances
+    if options[:volumes]
+      aws.list_volumes(options[:tags])
+      if !options[:tags].empty? && (options[:volume_type] || options[:iops])
+        aws.modify_volumes(
+          volume_type: options[:volume_type],
+          iops: options[:iops],
+          dry_run: options[:dry_run]
+        )
+      end
     else
       aws.list_instances(options[:tags])
+      aws.start_instances(dry_run: options[:dry_run]) if options[:start] && !options[:tags].empty?
+      aws.stop_instances(dry_run: options[:dry_run]) if options[:stop] && !options[:tags].empty?
     end
-    aws.start_instances(dry_run: options[:dry_run]) if options[:start]
-    aws.stop_instances(dry_run: options[:dry_run]) if options[:stop]
   when 'cost'
     aws = if options[:region]
             AwsTasks.new(region: options[:region])
