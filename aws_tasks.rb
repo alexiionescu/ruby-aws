@@ -7,6 +7,7 @@ require 'aws-sdk-s3'
 require 'json'
 require 'hirb'
 require 'pathname'
+require 'optparse'
 Hirb.enable
 
 # This class provides methods to interact with AWS EC2 instances and volumes.
@@ -70,6 +71,45 @@ class AwsTasks
     puts "Error getting information about instances: #{e.message}"
   end
 
+  # Starts all stopped instances from the last call to list_instances (with tag filter)
+  def start_instances(dry_run: true)
+    if @last_response
+      instance_ids = @last_response.select { |obj| obj.is_a?(Aws::EC2::Instance) && obj.state.name == 'stopped' }.map(&:id)
+      if instance_ids.empty?
+        puts 'No stopped instances to start.'
+      else
+        begin
+          @client.start_instances({ instance_ids: instance_ids, dry_run: dry_run })
+        rescue Aws::EC2::Errors::DryRunOperation => e
+          puts "Nothing Changed: #{e.message}"
+        rescue StandardError => e
+          puts "Error starting instances: #{e.message}"
+        end
+      end
+    else
+      puts "No instances to start.\nPlease run 'list_instances' with a tags filter before starting."
+    end
+  end
+
+  def stop_instances(dry_run: true)
+    if @last_response
+      instance_ids = @last_response.select { |obj| obj.is_a?(Aws::EC2::Instance) && obj.state.name == 'running' }.map(&:id)
+      if instance_ids.empty?
+        puts 'No running instances to stop.'
+      else
+        begin
+          @client.stop_instances({ instance_ids: instance_ids, dry_run: dry_run })
+        rescue Aws::EC2::Errors::DryRunOperation => e
+          puts "Nothing Changed: #{e.message}"
+        rescue StandardError => e
+          puts "Error stopping instances: #{e.message}"
+        end
+      end
+    else
+      puts "No instances to stop.\nPlease run 'list_instances' with a tags filter before stopping."
+    end
+  end
+
   # Lists all EC2 volumes (optional filters them by tags).
   #
   # @param tags [Hash<String, String|Array<String>>] Optional tags to filter the volumes.
@@ -119,6 +159,8 @@ class AwsTasks
               puts "Modifying volume: #{volume.id} #{dry_run ? '(dry run)' : ''} with type: #{volume_type}, iops: #{iops}"
               @client.modify_volume({ dry_run: dry_run, volume_id: volume.id, volume_type: volume_type, iops: iops })
               modified_count += 1
+            rescue Aws::EC2::Errors::DryRunOperation => e
+              puts "Nothing Changed: #{e.message}"
             rescue StandardError => e
               puts "Error modifying volume #{volume.class} : #{volume.id}: #{e.message}"
             end
@@ -245,7 +287,19 @@ class AwsStorage
     # @param file_path [String] The path to the file to upload.
     # @return [Boolean] True when the file is uploaded; otherwise false.
     def upload_file(file_path)
-      @object.upload_file(file_path)
+      fsize = File.size(file_path)
+      multipart_threshold = if fsize > 20 * 1024 * 1024
+                              fsize / 10
+                            elsif fsize > 10 * 1024 * 1024
+                              fsize / 5
+                            elsif fsize > 5 * 1024 * 1024
+                              fsize / 3
+                            end
+      time_started = Time.now
+      progress = proc do |bytes, totals|
+        print bytes.map.with_index { |b, i| "#{(100 * b / totals[i]).round(0)}%" }.join(' ') + " Total: #{(100.0 * bytes.sum / totals.sum).round(2)}% #{(bytes.sum / 1024 / (Time.now - time_started)).round(2)} KB/s #{' ' * 20}\r"
+      end
+      @object.upload_file(file_path, progress_callback: progress, multipart_threshold: multipart_threshold)
       true
     rescue Aws::Errors::ServiceError => e
       puts "Couldn't upload file #{file_path} to #{@object.key}. Here's why: #{e.message}"
@@ -299,20 +353,36 @@ class AwsStorage
     end
   end
 
-  def upload(file_path)
+  def upload(file_path, dry_run: false, no_overwrite: true)
     full_file_path = File.expand_path(file_path)
     object_key = Pathname.new(full_file_path).relative_path_from(Pathname.pwd).to_s
     curr_obj = @bucket.object(object_key)
-    if curr_obj.exists? && curr_obj.size == File.size(full_file_path) && curr_obj.etag !~ /.*-\d+/ && curr_obj.etag == AwsStorage.calculate_file_etag(full_file_path)
-      puts "File #{file_path} is already up-to-date."
+    if curr_obj.exists? && (no_overwrite || (curr_obj.size == File.size(full_file_path) && curr_obj.etag !~ /.*-\d+/ && curr_obj.etag == AwsStorage.calculate_file_etag(full_file_path)))
+      if no_overwrite
+        puts "File #{file_path} is already uploaded and no_overwrite is set."
+      else
+        puts "File #{file_path} is already uploaded and has the same size and ETag."
+      end
       return
     end
+    puts "#{DateTime.now} Uploading #{file_path} to #{@bucket_name}:#{object_key}..."
+    return if dry_run
 
     object = Aws::S3::Object.new(@bucket_name, object_key, client: @client)
     wrapper = ObjectUploadFileWrapper.new(object)
     return unless wrapper.upload_file(full_file_path)
 
-    puts "File #{file_path} successfully uploaded to #{@bucket_name}:#{object_key}."
+    puts "#{DateTime.now} File #{file_path} successfully uploaded to #{@bucket_name}:#{object_key}."
+  end
+
+  def upload_many(glob_pattern, dry_run: true, no_overwrite: true)
+    return unless @bucket
+
+    Dir.glob(glob_pattern).each do |file_path|
+      next unless File.file?(file_path)
+
+      upload(file_path, dry_run: dry_run, no_overwrite: no_overwrite)
+    end
   end
 
   def list(glob_pattern = nil, max_objects = 100, local_etag: false)
@@ -343,7 +413,119 @@ class AwsStorage
   end
 end
 
+def run_with_args(args)
+  options = {
+    overwrite: false,
+    tags: {}
+  }
+  command = args[0]
+  valid_command = %w[s3 ec2 cost].include?(command)
+  OptionParser.new(args[1..]) do |opts| # rubocop:disable Metrics/BlockLength
+    opts.banner = 'Usage: aws_tasks.rb [command] [options]'
+    opts.separator 'Commands: s3 | ec2 | cost' unless valid_command
+
+    case command
+    when 's3'
+      opts.on('-b', '--bucket BUCKET', 'Specify the S3 bucket name') do |bucket|
+        options[:bucket] = bucket
+      end
+      opts.on('-g', '--glob GLOB', 'Glob pattern to filter objects in the bucket') do |glob|
+        options[:glob] = glob
+      end
+      opts.on('-l', '--list', 'List objects in the bucket') do
+        options[:list] = true
+      end
+
+      opts.on('-u', '--upload FILE', 'Upload a file to the bucket') do |file|
+        options[:upload] = file
+      end
+      opts.on('-m', '--upload-many GLOB', 'Upload many files matching a glob pattern to the bucket') do |glob|
+        options[:upload_many] = glob
+      end
+      opts.on('-o', '--overwrite', 'Overwrite existing files') do
+        options[:overwrite] = true
+      end
+
+      opts.on('-d', '--delete FILE', 'Delete a file from the bucket') do |file|
+        options[:delete] = file
+      end
+    when 'ec2'
+      opts.on('-n', '--names a,b,c', Array, 'Specify EC2 instance names') do |names|
+        options[:tags].merge!({ Name: names.map(&:strip) })
+      end
+      opts.on('--start', 'Start EC2 instances') do
+        options[:start] = true
+      end
+      opts.on('--stop', 'Stop EC2 instances') do
+        options[:stop] = true
+      end
+    end
+
+    if valid_command
+      opts.on('-r', '--region REGION', 'AWS region to use (default is env var AWS_REGION or ~/.aws/config settings)') do |region|
+        options[:region] = region
+      end
+      opts.on('--dry-run', 'Perform a dry run (no changes will be made)') do
+        options[:dry_run] = true
+      end
+    end
+    opts.on('-h', '--help', 'Show this help message') do
+      puts opts
+      exit
+    end
+  end.parse!(args)
+
+  return unless valid_command
+
+  case command
+  when 's3'
+    if options[:bucket].nil?
+      puts 'Bucket name is required for S3 operations.'
+      return
+    end
+    s = if options[:region]
+          AwsStorage.new(options[:bucket], region: options[:region])
+        else
+          AwsStorage.new(options[:bucket])
+        end
+    # Now you can use the options hash to determine what to do
+    if options[:list]
+      s.list(options[:glob])
+    elsif options[:upload]
+      s.upload(options[:upload], dry_run: options[:dry_run], no_overwrite: !options[:overwrite])
+    elsif options[:upload_many]
+      s.upload_many(options[:upload_many], dry_run: options[:dry_run], no_overwrite: !options[:overwrite])
+    elsif options[:delete]
+      s.delete(options[:delete], dry_run: options[:dry_run])
+    end
+  when 'ec2'
+    aws = if options[:region]
+            AwsTasks.new(region: options[:region])
+          else
+            AwsTasks.new
+          end
+    if options[:tags].empty?
+      aws.list_instances
+    else
+      aws.list_instances(options[:tags])
+    end
+    aws.start_instances(dry_run: options[:dry_run]) if options[:start]
+    aws.stop_instances(dry_run: options[:dry_run]) if options[:stop]
+  when 'cost'
+    aws = if options[:region]
+            AwsTasks.new(region: options[:region])
+          else
+            AwsTasks.new
+          end
+    aws.cost_report
+  end
+end
+
 # if run with pry: `ruby -rpry script`
-if defined?(Pry) && ($PROGRAM_NAME == __FILE__)
-  binding.pry # rubocop:disable Lint/Debugger
+if $PROGRAM_NAME == __FILE__
+  if defined?(Pry) && ARGV.count.zero?
+    binding.pry # rubocop:disable Lint/Debugger
+  else
+    run_with_args(ARGV)
+  end
 end
