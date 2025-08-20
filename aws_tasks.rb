@@ -48,6 +48,18 @@ class AwsTasks
     end
   end
 
+  def add_tags(resource_id, tags = {}, dry_run: true)
+    @client.create_tags({
+                          resources: [resource_id],
+                          tags: tags.map { |k, v| { key: k.to_s, value: v.is_a?(Array) ? v.first.to_s : v.to_s } },
+                          dry_run: dry_run
+                        })
+  rescue Aws::EC2::Errors::DryRunOperation => e
+    puts "Nothing Changed: #{e.message}"
+  rescue StandardError => e
+    puts "Error adding tags: #{e.message}"
+  end
+
   # Lists all EC2 instances (optional filters them by tags).
   #
   # @param tags [Hash<String, String|Array<String>>] Optional tags to filter the instances.
@@ -455,6 +467,12 @@ def run_with_args(args)
       opts.on('-n', '--names a,b,c', Array, 'Specify EC2 `Name` tags for filtering lists') do |names|
         options[:tags].merge!({ Name: names.map(&:strip) })
       end
+      opts.on('-t', '--tags KEY=VALUE', 'Specify tags for filtering (e.g., Key1=Value1,Key2=Value2)') do |tag|
+        options[:tags].merge!(Hash[*tag.split('=').map(&:strip)])
+      end
+      opts.on('--add-tags RESOURCE_ID', 'Add tags specified with --tags or --names to resource RESOURCE_ID. For names only the first name will be used.') do |resource_id|
+        options[:add_tags] = resource_id
+      end
       opts.on('--volumes', 'List EC2 volumes') do
         options[:volumes] = true
       end
@@ -523,7 +541,9 @@ def run_with_args(args)
           else
             AwsTasks.new
           end
-    if options[:volumes]
+    if options[:add_tags]
+      aws.add_tags(options[:add_tags], options[:tags], dry_run: options[:dry_run])
+    elsif options[:volumes]
       aws.list_volumes(options[:tags])
       if !options[:tags].empty? && (options[:volume_type] || options[:iops])
         aws.modify_volumes(
