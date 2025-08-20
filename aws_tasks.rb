@@ -60,6 +60,16 @@ class AwsTasks
     puts "Error adding tags: #{e.message}"
   end
 
+  def list_add_tags(tags = {}, dry_run: true)
+    if @last_response
+      @last_response.each do |obj|
+        add_tags(obj.id, tags, dry_run: dry_run) unless obj.id.nil?
+      end
+    else
+      puts "No resources to add tags to.\nPlease run 'list_*' with a tag filtering param before adding tags."
+    end
+  end
+
   # Lists all EC2 instances (optional filters them by tags).
   #
   # @param tags [Hash<String, String|Array<String>>] Optional tags to filter the instances.
@@ -430,13 +440,18 @@ end
 def run_with_args(args)
   options = {
     overwrite: false,
-    tags: {}
+    tags: {},
+    list_add_tags: {}
   }
   command = args[0]
-  valid_command = %w[s3 ec2 cost].include?(command)
+  command_list = %w[s3 ec2 cost]
+  valid_command = command_list.include?(command)
   parser = OptionParser.new do |opts| # rubocop:disable Metrics/BlockLength
     opts.banner = 'Usage: aws_tasks.rb [command] [options]'
-    opts.separator 'Commands: s3 | ec2 | cost' unless valid_command
+    unless valid_command
+      opts.separator "Commands: #{command_list.join(' | ')}"
+      opts.separator 'For command help run aws_tasks.rb [command] -h'
+    end
 
     case command
     when 's3'
@@ -464,13 +479,16 @@ def run_with_args(args)
         options[:delete] = file
       end
     when 'ec2'
-      opts.on('-n', '--names a,b,c', Array, 'Specify EC2 `Name` tags for filtering lists') do |names|
+      opts.on('-n', '--names expr1,expr2,expr3', Array, 'Specify EC2 `Name` tags for filtering lists. expr will be used as regular expressions for matching') do |names|
         options[:tags].merge!({ Name: names.map(&:strip) })
       end
-      opts.on('-t', '--tags KEY=VALUE', 'Specify tags for filtering (e.g., Key1=Value1,Key2=Value2)') do |tag|
+      opts.on('-t', '--tag KEY=VALUE', 'Specify tags for filtering') do |tag|
         options[:tags].merge!(Hash[*tag.split('=').map(&:strip)])
       end
-      opts.on('--add-tags RESOURCE_ID', 'Add tags specified with --tags or --names to resource RESOURCE_ID. For names only the first name will be used.') do |resource_id|
+      opts.on('--list-add-tag KEY=VALUE', 'Add tags to the last list resources filtered by --names or --tag') do |tag|
+        options[:list_add_tags].merge!(Hash[*tag.split('=').map(&:strip)])
+      end
+      opts.on('--add-tags RESOURCE_ID', 'Add tags specified with --tag or --names to resource RESOURCE_ID. For names only the first name will be used.') do |resource_id|
         options[:add_tags] = resource_id
       end
       opts.on('--volumes', 'List EC2 volumes') do
@@ -490,14 +508,19 @@ def run_with_args(args)
       opts.on('--stop', 'Stop EC2 instances') do
         options[:stop] = true
       end
+    when 'help', '-h', '--help'
+      puts opts
+      exit
     end
 
     if valid_command
       opts.on('--region REGION', 'AWS region to use (default is env var AWS_REGION or ~/.aws/config settings)') do |region|
         options[:region] = region
       end
-      opts.on('--dry-run', 'Perform a dry run (no changes will be made)') do
-        options[:dry_run] = true
+      if command != 'cost'
+        opts.on('--dry-run', 'Perform a dry run (no changes will be made)') do
+          options[:dry_run] = true
+        end
       end
     end
     opts.on('-h', '--help', 'Show this help message') do
@@ -552,10 +575,12 @@ def run_with_args(args)
           dry_run: options[:dry_run]
         )
       end
+      aws.list_add_tags(options[:list_add_tags], dry_run: options[:dry_run]) unless options[:list_add_tags].empty?
     else
       aws.list_instances(options[:tags])
       aws.start_instances(dry_run: options[:dry_run]) if options[:start] && !options[:tags].empty?
       aws.stop_instances(dry_run: options[:dry_run]) if options[:stop] && !options[:tags].empty?
+      aws.list_add_tags(options[:list_add_tags], dry_run: options[:dry_run]) unless options[:list_add_tags].empty?
     end
   when 'cost'
     aws = if options[:region]
