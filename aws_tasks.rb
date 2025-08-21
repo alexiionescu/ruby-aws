@@ -246,6 +246,7 @@ class AwsStorage
   # @return [Aws::S3::Client] The AWS S3 client used for API calls.
   attr_reader :bucket_name, :client, :bucket
 
+  MULTIPART_ETAG = 'MultipartETag'
   # Initializes the AwsStorage instance with the specified bucket name and options.
   #
   # @param bucket_name [String] The name of the S3 bucket.
@@ -291,8 +292,7 @@ class AwsStorage
     return 'NoETag' unless File.exist?(file_path)
 
     # Calculate the ETag for the file
-    digest = Digest::MD5.file(file_path).hexdigest
-    "\"#{digest}\""
+    Digest::MD5.file(file_path).hexdigest
   rescue StandardError => e
     "LocalETagError: #{e.message}"
   end
@@ -304,6 +304,11 @@ class AwsStorage
     # @param object [Aws::S3::Object] An existing Amazon S3 object.
     def initialize(object)
       @object = object
+      @multipart_threshold = nil
+    end
+
+    def was_multipart?
+      !@multipart_threshold.nil?
     end
 
     # Uploads a file to an Amazon S3 object by using a managed uploader.
@@ -312,18 +317,18 @@ class AwsStorage
     # @return [Boolean] True when the file is uploaded; otherwise false.
     def upload_file(file_path)
       fsize = File.size(file_path)
-      multipart_threshold = if fsize > 20 * 1024 * 1024
-                              fsize / 10
-                            elsif fsize > 10 * 1024 * 1024
-                              fsize / 5
-                            elsif fsize > 5 * 1024 * 1024
-                              fsize / 3
-                            end
+      @multipart_threshold = if fsize > 20 * 1024 * 1024
+                               fsize / 10
+                             elsif fsize > 10 * 1024 * 1024
+                               fsize / 5
+                             elsif fsize > 5 * 1024 * 1024
+                               fsize / 3
+                             end
       time_started = Time.now
       progress = proc do |bytes, totals|
         print bytes.map.with_index { |b, i| "#{(100 * b / totals[i]).round(0)}%" }.join(' ') + " Total: #{(100.0 * bytes.sum / totals.sum).round(2)}% #{(bytes.sum / 1024 / (Time.now - time_started)).round(2)} KB/s #{' ' * 20}\r"
       end
-      @object.upload_file(file_path, progress_callback: progress, multipart_threshold: multipart_threshold)
+      @object.upload_file(file_path, progress_callback: progress, multipart_threshold: @multipart_threshold)
       true
     rescue Aws::Errors::ServiceError => e
       puts "Couldn't upload file #{file_path} to #{@object.key}. Here's why: #{e.message}"
@@ -356,9 +361,15 @@ class AwsStorage
           etag: obj.etag || 'NoETag',
           local_etag: if local_etag
                         if obj.etag =~ /.*-\d+/
-                          'Multipart'
+                          begin
+                            res = @bucket.client.get_object_tagging(bucket: @bucket.name, key: obj.key)
+                            AwsStorage.calculate_file_etag(obj.key) == res.tag_set.find { |tag| tag.key == AwsStorage::MULTIPART_ETAG }&.value ? 'Match' : 'NoMatch'
+                          rescue Aws::Errors::ServiceError => e
+                            puts "Couldn't retrieve tags for #{obj.key}. Here's why: #{e.message}"
+                            'NoMatch'
+                          end
                         else
-                          AwsStorage.calculate_file_etag(obj.key) == obj.etag ? 'Match' : 'NoMatch'
+                          "\"#{AwsStorage.calculate_file_etag(obj.key)}\"" == obj.etag ? 'Match' : 'NoMatch'
                         end
                       else
                         'NotChecked'
@@ -377,17 +388,31 @@ class AwsStorage
     end
   end
 
-  def upload(file_path, dry_run: false, no_overwrite: true)
+  def upload(file_path, dry_run: false, no_overwrite: true, force: false)
     full_file_path = File.expand_path(file_path)
     object_key = Pathname.new(full_file_path).relative_path_from(Pathname.pwd).to_s
     curr_obj = @bucket.object(object_key)
-    if curr_obj.exists? && (no_overwrite || (curr_obj.size == File.size(full_file_path) && curr_obj.etag !~ /.*-\d+/ && curr_obj.etag == AwsStorage.calculate_file_etag(full_file_path)))
+    if !force && curr_obj.exists?
       if no_overwrite
-        puts "File #{file_path} is already uploaded and no_overwrite is set."
-      else
-        puts "File #{file_path} is already uploaded and has the same size and ETag."
+        puts "Skipping #{file_path}, exists and no_overwrite is set."
+        return
+      elsif curr_obj.size == File.size(full_file_path)
+        local_etag = AwsStorage.calculate_file_etag(full_file_path)
+        if curr_obj.etag !~ /.*-\d+/ && curr_obj.etag == "\"#{local_etag}\""
+          puts "Skipping #{file_path}, has the same size and ETag."
+          return
+        elsif curr_obj.size == File.size(full_file_path) && curr_obj.etag =~ /.*-\d+/
+          begin
+            res = @client.get_object_tagging(bucket: @bucket_name, key: object_key)
+            if res.tag_set.any? { |tag| tag.key == AwsStorage::MULTIPART_ETAG && tag.value == local_etag }
+              puts "Skipping #{file_path}, has the same size and Multipart ETag."
+              return
+            end
+          rescue Aws::Errors::ServiceError => e
+            puts "Couldn't retrieve tags for #{object_key}. Here's why: #{e.message}"
+          end
+        end
       end
-      return
     end
     puts "#{DateTime.now} Uploading #{file_path} to #{@bucket_name}:#{object_key}..."
     return if dry_run
@@ -396,16 +421,27 @@ class AwsStorage
     wrapper = ObjectUploadFileWrapper.new(object)
     return unless wrapper.upload_file(full_file_path)
 
+    if wrapper.was_multipart?
+      params = { bucket: @bucket_name,
+                 key: object_key,
+                 tagging: {
+                   tag_set: [
+                     { key: AwsStorage::MULTIPART_ETAG, value: AwsStorage.calculate_file_etag(full_file_path) }
+                   ]
+                 } }
+      @client.put_object_tagging(params)
+    end
+
     puts "#{DateTime.now} File #{file_path} successfully uploaded to #{@bucket_name}:#{object_key}."
   end
 
-  def upload_many(glob_pattern, dry_run: true, no_overwrite: true)
+  def upload_many(glob_pattern, dry_run: true, no_overwrite: true, force: false)
     return unless @bucket
 
     Dir.glob(glob_pattern).each do |file_path|
       next unless File.file?(file_path)
 
-      upload(file_path, dry_run: dry_run, no_overwrite: no_overwrite)
+      upload(file_path, dry_run: dry_run, no_overwrite: no_overwrite, force: force)
     end
   end
 
@@ -471,8 +507,14 @@ def run_with_args(args)
       opts.on('-m', '--upload-many GLOB', 'Upload many files matching a glob pattern to the bucket') do |glob|
         options[:upload_many] = glob
       end
-      opts.on('-o', '--overwrite', 'Overwrite existing files') do
+      opts.on('-o', '--overwrite', 'Overwrite existing files if they differ') do
         options[:overwrite] = true
+      end
+      opts.on('--force', 'Force overwrite of existing files') do
+        options[:force] = true
+      end
+      opts.on('--local-etag', 'Check local ETag for files in the bucket') do
+        options[:local_etag] = true
       end
 
       opts.on('-d', '--delete FILE', 'Delete a file from the bucket') do |file|
@@ -550,11 +592,11 @@ def run_with_args(args)
         end
     # Now you can use the options hash to determine what to do
     if options[:list]
-      s.list(options[:glob])
+      s.list(options[:glob], local_etag: options[:local_etag])
     elsif options[:upload]
-      s.upload(options[:upload], dry_run: options[:dry_run], no_overwrite: !options[:overwrite])
+      s.upload(options[:upload], dry_run: options[:dry_run], no_overwrite: !options[:overwrite], force: options[:force])
     elsif options[:upload_many]
-      s.upload_many(options[:upload_many], dry_run: options[:dry_run], no_overwrite: !options[:overwrite])
+      s.upload_many(options[:upload_many], dry_run: options[:dry_run], no_overwrite: !options[:overwrite], force: options[:force])
     elsif options[:delete]
       s.delete(options[:delete], dry_run: options[:dry_run])
     end
