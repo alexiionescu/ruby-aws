@@ -1,4 +1,4 @@
-#!/usr/bin/env ruby -rpry
+#!/usr/bin/env ruby
 # frozen_string_literal: true
 
 require 'aws-sdk-ec2'
@@ -288,6 +288,16 @@ class AwsStorage
     end
   end
 
+  def self.calculate_multipart_threshold(fsize)
+    if fsize > 20 * 1024 * 1024
+      fsize / 10
+    elsif fsize > 10 * 1024 * 1024
+      fsize / 5
+    elsif fsize > 5 * 1024 * 1024
+      fsize / 3
+    end
+  end
+
   def self.calculate_file_etag(file_path)
     return 'NoETag' unless File.exist?(file_path)
 
@@ -304,7 +314,6 @@ class AwsStorage
     # @param object [Aws::S3::Object] An existing Amazon S3 object.
     def initialize(object)
       @object = object
-      @multipart_threshold = nil
     end
 
     def was_multipart?
@@ -317,13 +326,7 @@ class AwsStorage
     # @return [Boolean] True when the file is uploaded; otherwise false.
     def upload_file(file_path)
       fsize = File.size(file_path)
-      @multipart_threshold = if fsize > 20 * 1024 * 1024
-                               fsize / 10
-                             elsif fsize > 10 * 1024 * 1024
-                               fsize / 5
-                             elsif fsize > 5 * 1024 * 1024
-                               fsize / 3
-                             end
+      @multipart_threshold = AwsStorage.calculate_multipart_threshold(fsize)
       time_started = Time.now
       progress = proc do |bytes, totals|
         print bytes.map.with_index { |b, i| "#{(100 * b / totals[i]).round(0)}%" }.join(' ') + " Total: #{(100.0 * bytes.sum / totals.sum).round(2)}% #{(bytes.sum / 1024 / (Time.now - time_started)).round(2)} KB/s #{' ' * 20}\r"
@@ -381,11 +384,42 @@ class AwsStorage
         fields: %i[name size modified etag local_etag],
         filters: { size: ->(size) { AwsStorage.size_human_readable(size) } }
       )
-      objs.size
+      objs
     rescue Aws::Errors::ServiceError => e
       puts "Couldn't list objects in bucket #{bucket.name}. Here's why: #{e.message}"
-      0
     end
+  end
+
+  def download_last_listed(dry_run: false, no_overwrite: true, force: false)
+    return if @last_list.nil?
+
+    @last_list.each do |obj|
+      download(obj, dry_run: dry_run, no_overwrite: no_overwrite, force: force)
+    end
+  end
+
+  def download(obj, dry_run: false, no_overwrite: true, force: false)
+    full_file_path = File.expand_path(obj[:name])
+    if File.exist?(full_file_path) && !force
+      if no_overwrite
+        puts "Skipping #{obj[:name]}, exists and no_overwrite is set."
+        return
+      elsif obj[:local_etag] == 'Match'
+        puts "Skipping #{obj[:name]}, has the same size and ETag."
+        return
+      end
+    end
+    puts "#{DateTime.now} Downloading #{@bucket_name}:#{obj[:name]} to #{obj[:name]}..."
+    return if dry_run
+
+    object = Aws::S3::Object.new(@bucket_name, obj[:name], client: @client)
+    time_started = Time.now
+    progress = proc do |bytes, part_sizes, file_size|
+      print bytes.map.with_index { |b, i| "#{(100 * b / (part_sizes[i] || file_size)).round(0)}%" }.join(' ') + " Total: #{(100.0 * bytes.sum / file_size).round(2)}% #{(bytes.sum / 1024 / (Time.now - time_started)).round(2)} KB/s #{' ' * 20}\r"
+    end
+    return unless object.download_file(full_file_path, progress_callback: progress, dry_run: dry_run)
+
+    puts "#{DateTime.now} File #{@bucket_name}:#{obj[:name]} successfully downloaded to #{obj[:name]}."
   end
 
   def upload(file_path, dry_run: false, no_overwrite: true, force: false)
@@ -449,25 +483,32 @@ class AwsStorage
     return unless @bucket
 
     wrapper = BucketListObjectsWrapper.new(@bucket)
-    wrapper.list_objects(glob_pattern, max_objects, local_etag: local_etag)
+    @last_list = wrapper.list_objects(glob_pattern, max_objects, local_etag: local_etag)
   end
 
-  def delete(name)
-    @client.delete_object(bucket: @bucket_name, key: name)
+  def delete(name, dry_run: true)
+    @client.delete_object(bucket: @bucket_name, key: name, dry_run: dry_run)
   end
 
-  def delete_many(glob_pattern)
+  def delete_many(glob_pattern, dry_run: true)
     return unless @bucket
 
     objs = @bucket.objects.select { |obj| glob_pattern.nil? || File.fnmatch(glob_pattern, obj.key, File::FNM_EXTGLOB) }
     objs.each do |obj|
-      print "Are you sure you want to delete #{obj.key}? (y/N) "
-      confirmation = gets.chomp
+      print "Are you sure you want to delete #{obj.key}? ([yY] yes/[n] no/[N] no to all) "
+      confirmation = $stdin.gets.chomp
       if confirmation.downcase == 'y'
-        @client.delete_object(bucket: @bucket_name, key: obj.key)
-        puts "#{obj.key} has been deleted."
-      else
+        if dry_run
+          puts "#{obj.key} would be deleted but DryRun is set."
+        else
+          @client.delete_object(bucket: @bucket_name, key: obj.key)
+          puts "#{obj.key} has been deleted."
+        end
+      elsif confirmation == 'n'
         puts "#{obj.key} was not deleted."
+      elsif confirmation == 'N'
+        puts 'No more files will be deleted.'
+        break
       end
     end
   end
@@ -507,18 +548,24 @@ def run_with_args(args)
       opts.on('-m', '--upload-many GLOB', 'Upload many files matching a glob pattern to the bucket') do |glob|
         options[:upload_many] = glob
       end
+      opts.on('--local-etag', 'Check local ETag for files in the bucket') do
+        options[:local_etag] = true
+      end
       opts.on('-o', '--overwrite', 'Overwrite existing files if they differ') do
         options[:overwrite] = true
       end
       opts.on('--force', 'Force overwrite of existing files') do
         options[:force] = true
       end
-      opts.on('--local-etag', 'Check local ETag for files in the bucket') do
-        options[:local_etag] = true
+      opts.on('-d', '--download', 'Download listed files') do
+        raise OptionParser::InvalidArgument, 'Download option requires -l/--list' unless options[:list]
+
+        options[:download] = true
+        options[:local_etag] = true # always check local ETag when downloading
       end
 
-      opts.on('-d', '--delete FILE', 'Delete a file from the bucket') do |file|
-        options[:delete] = file
+      opts.on('--delete-many GLOB', 'Delete files from the bucket matching the glob pattern') do |glob|
+        options[:delete] = glob
       end
     when 'ec2'
       opts.on('-n', '--names expr1,expr2,expr3', Array, 'Specify EC2 `Name` tags for filtering lists. expr will be used as regular expressions for matching') do |names|
@@ -593,12 +640,13 @@ def run_with_args(args)
     # Now you can use the options hash to determine what to do
     if options[:list]
       s.list(options[:glob], local_etag: options[:local_etag])
+      s.download_last_listed(dry_run: options[:dry_run], no_overwrite: !options[:overwrite], force: options[:force]) if options[:download]
     elsif options[:upload]
       s.upload(options[:upload], dry_run: options[:dry_run], no_overwrite: !options[:overwrite], force: options[:force])
     elsif options[:upload_many]
       s.upload_many(options[:upload_many], dry_run: options[:dry_run], no_overwrite: !options[:overwrite], force: options[:force])
     elsif options[:delete]
-      s.delete(options[:delete], dry_run: options[:dry_run])
+      s.delete_many(options[:delete], dry_run: options[:dry_run])
     end
   when 'ec2'
     aws = if options[:region]
@@ -634,8 +682,8 @@ def run_with_args(args)
   end
 end
 
-# if run with pry: `ruby -rpry script`
 if $PROGRAM_NAME == __FILE__
+  # if run with pry: `ruby -rpry aws_tasks.rb`
   if defined?(Pry) && ARGV.count.zero?
     binding.pry # rubocop:disable Lint/Debugger
   else
