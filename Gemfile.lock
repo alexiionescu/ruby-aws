@@ -78,6 +78,7 @@ DEPENDENCIES
   hirb (~> 0.7.3)
   pry (~> 0.15.2)
   rubocop (~> 1.79)
+  ruby-progressbar (~> 1.13)
 
 BUNDLED WITH
    2.6.7

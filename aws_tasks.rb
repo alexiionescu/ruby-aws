@@ -8,6 +8,9 @@ require 'json'
 require 'hirb'
 require 'pathname'
 require 'optparse'
+require 'tty-cursor'
+require 'rainbow'
+require 'ruby-progressbar'
 Hirb.enable
 
 VALID_VOLUME_TYPES = %w[standard gp2 gp3 io1 io2 st1 sc1].freeze
@@ -289,13 +292,10 @@ class AwsStorage
   end
 
   def self.calculate_multipart_threshold(fsize)
-    if fsize > 20 * 1024 * 1024
-      fsize / 10
-    elsif fsize > 10 * 1024 * 1024
-      fsize / 5
-    elsif fsize > 5 * 1024 * 1024
-      fsize / 3
-    end
+    mb = fsize / 1024 / 1024
+    return unless mb >= 5
+
+    (mb / 5).clamp(2, 10) * 1024 * 1024
   end
 
   def self.calculate_file_etag(file_path)
@@ -327,12 +327,18 @@ class AwsStorage
     def upload_file(file_path)
       fsize = File.size(file_path)
       @multipart_threshold = AwsStorage.calculate_multipart_threshold(fsize)
-      time_started = Time.now
-      progress = proc do |bytes, totals|
-        print bytes.map.with_index { |b, i| "#{(100 * b / totals[i]).round(0)}%" }.join(' ') + " Total: #{(100.0 * bytes.sum / totals.sum).round(2)}% #{(bytes.sum / 1024 / (Time.now - time_started)).round(2)} KB/s #{' ' * 20}\r"
+      # cursor = TTY::Cursor
+      progress_bar = ProgressBar.create(title: File.basename(file_path).rjust(40), total: fsize / 1024, format: "%t #{Rainbow('|%B|').blue} %p%% %e %r KB/s")
+      progress_proc = proc do |bytes, _totals|
+        progress_bar.progress = bytes.sum / 1024
       end
-      @object.upload_file(file_path, progress_callback: progress, multipart_threshold: @multipart_threshold)
+      @object.upload_file(file_path, progress_callback: progress_proc, multipart_threshold: @multipart_threshold)
+      # puts "#{cursor.up}#{cursor.clear_line}Upload complete: #{file_path} -> #{@object.bucket.name}:#{@object.key}"
+      # Annoying bug when sometimes the progress bar is duplicated at the end
       true
+    rescue Interrupt
+      puts "\nUpload interrupted."
+      false
     rescue Aws::Errors::ServiceError => e
       puts "Couldn't upload file #{file_path} to #{@object.key}. Here's why: #{e.message}"
       false
@@ -409,17 +415,13 @@ class AwsStorage
         return
       end
     end
-    puts "#{DateTime.now} Downloading #{@bucket_name}:#{obj[:name]} to #{obj[:name]}..."
     return if dry_run
 
     object = Aws::S3::Object.new(@bucket_name, obj[:name], client: @client)
-    time_started = Time.now
-    progress = proc do |bytes, part_sizes, file_size|
-      print bytes.map.with_index { |b, i| "#{(100 * b / (part_sizes[i] || file_size)).round(0)}%" }.join(' ') + " Total: #{(100.0 * bytes.sum / file_size).round(2)}% #{(bytes.sum / 1024 / (Time.now - time_started)).round(2)} KB/s #{' ' * 20}\r"
-    end
-    return unless object.download_file(full_file_path, progress_callback: progress, dry_run: dry_run)
-
-    puts "#{DateTime.now} File #{@bucket_name}:#{obj[:name]} successfully downloaded to #{obj[:name]}."
+    FileUtils.mkdir_p(File.dirname(full_file_path))
+    progress_bar = ProgressBar.create(title: File.basename(obj[:name]).rjust(40), total: object.size / 1024, format: "%t #{Rainbow('|%B|').blue} %p%% %e %r KB/s")
+    progress_proc = proc { |bytes| progress_bar.progress = bytes.sum / 1024 }
+    object.download_file(full_file_path, progress_callback: progress_proc, dry_run: dry_run)
   end
 
   def upload(file_path, dry_run: false, no_overwrite: true, force: false)
@@ -443,30 +445,26 @@ class AwsStorage
               return
             end
           rescue Aws::Errors::ServiceError => e
-            puts "Couldn't retrieve tags for #{object_key}. Here's why: #{e.message}"
+            puts "WARN: Couldn't retrieve tags for #{object_key}. Here's why: #{e.message}"
           end
         end
       end
     end
-    puts "#{DateTime.now} Uploading #{file_path} to #{@bucket_name}:#{object_key}..."
     return if dry_run
 
     object = Aws::S3::Object.new(@bucket_name, object_key, client: @client)
     wrapper = ObjectUploadFileWrapper.new(object)
     return unless wrapper.upload_file(full_file_path)
+    return unless wrapper.was_multipart?
 
-    if wrapper.was_multipart?
-      params = { bucket: @bucket_name,
-                 key: object_key,
-                 tagging: {
-                   tag_set: [
-                     { key: AwsStorage::MULTIPART_ETAG, value: AwsStorage.calculate_file_etag(full_file_path) }
-                   ]
-                 } }
-      @client.put_object_tagging(params)
-    end
-
-    puts "#{DateTime.now} File #{file_path} successfully uploaded to #{@bucket_name}:#{object_key}."
+    params = { bucket: @bucket_name,
+               key: object_key,
+               tagging: {
+                 tag_set: [
+                   { key: AwsStorage::MULTIPART_ETAG, value: AwsStorage.calculate_file_etag(full_file_path) }
+                 ]
+               } }
+    @client.put_object_tagging(params)
   end
 
   def upload_many(glob_pattern, dry_run: true, no_overwrite: true, force: false)
