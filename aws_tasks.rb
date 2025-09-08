@@ -106,7 +106,10 @@ class AwsTasks
         puts 'No stopped instances to start.'
       else
         begin
-          @client.start_instances({ instance_ids: instance_ids, dry_run: dry_run })
+          res = @client.start_instances({ instance_ids: instance_ids, dry_run: dry_run })
+          puts Hirb::Helpers::Table.render(res.starting_instances.map do |i|
+            { id: i.instance_id, current_state: i.current_state.name }
+          end)
         rescue Aws::EC2::Errors::DryRunOperation => e
           puts "Nothing Changed: #{e.message}"
         rescue StandardError => e
@@ -125,7 +128,10 @@ class AwsTasks
         puts 'No running instances to stop.'
       else
         begin
-          @client.stop_instances({ instance_ids: instance_ids, dry_run: dry_run })
+          res = @client.stop_instances({ instance_ids: instance_ids, dry_run: dry_run })
+          puts Hirb::Helpers::Table.render(res.stopping_instances.map do |i|
+            { id: i.instance_id, current_state: i.current_state.name }
+          end)
         rescue Aws::EC2::Errors::DryRunOperation => e
           puts "Nothing Changed: #{e.message}"
         rescue StandardError => e
