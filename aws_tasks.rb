@@ -11,6 +11,8 @@ require 'optparse'
 require 'tty-cursor'
 require 'rainbow'
 require 'ruby-progressbar'
+require 'yaml'
+require 'logger'
 Hirb.enable
 
 VALID_VOLUME_TYPES = %w[standard gp2 gp3 io1 io2 st1 sc1].freeze
@@ -27,10 +29,14 @@ class AwsTasks
   attr_accessor :client, :ec2_resource, :last_response, :ce
 
   def initialize(**options)
+    @logger = Logger.new(options.delete(:log_file) || $stdout)
+    @logger.level = options.delete(:log_level) || Logger::WARN
+    puts "Logger level set to #{@logger.level}" if @logger.level != Logger::WARN
+
     @client = Aws::EC2::Client.new(**options)
     @ec2_resource = Aws::EC2::Resource.new(client: @client)
     @ce = Aws::CostExplorer::Client.new(**options)
-    puts "Using AWS region: #{@client.config.region}" if @client.config.region
+    puts "AwsTasks: Using region: #{Rainbow(@client.config.region).orange}" if @client.config.region
   end
 
   # Filters the response based on the provided tags.
@@ -141,6 +147,59 @@ class AwsTasks
     else
       puts "No instances to stop.\nPlease run 'list_instances' with a tags filter before stopping."
     end
+  end
+
+  def list_reservations
+    reservations = Hash.new(0)
+    instances = Hash.new(0)
+    @client.describe_reserved_instances(filters: [{ name: 'state', values: ['active'] }]).reserved_instances.each do |ri|
+      # type = if ri.product_description =~ /VPC/
+      #          "ec2:#{ri.instance_type}:vpc"
+      #        else
+      #          "ec2:#{ri.instance_type}:#{ri.availability_zone || 'none'}"
+      #        end
+      @logger.debug("Found reservation: #{ri.instance_type} x #{ri.instance_count} (#{ri.availability_zone || 'none'})")
+      reservations[ri.instance_type.to_s] += ri.instance_count
+    end
+
+    @client.describe_instances(filters: [{ name: 'instance-state-name', values: ['running'] }]).reservations.each do |r|
+      r.instances.each do |i|
+        # type = if i.vpc_id.nil?
+        #          "ec2:#{i.instance_type}:#{i.placement.availability_zone}"
+        #        else
+        #          "ec2:#{i.instance_type}:vpc"
+        #        end
+        # type += ":#{i.tags.find { |tag| tag.key == 'Name' }&.value || 'unnamed'}"
+        @logger.debug("Found running instance: #{i.instance_type} (#{i.placement.availability_zone || 'none'}) Tags: Name: #{i.tags.find { |tag| tag.key == 'Name' }&.value || 'unnamed'}")
+        instances[i.instance_type.to_s] += 1
+      end
+    end
+
+    unused_reservations = reservations.clone
+    unreserved_instances = instances.clone
+
+    instances.each do |type, count|
+      unused_reservations[type] -= count
+      unused_reservations[type] = 0 if unused_reservations[type].negative?
+    end
+
+    reservations.each do |type, count|
+      unreserved_instances[type] -= count
+      unreserved_instances[type] = 0 if unreserved_instances[type].negative?
+    end
+
+    unless unused_reservations.empty?
+      puts 'Unused Reservations:'
+      puts Hirb::Helpers::Table.render(unused_reservations.map do |type, count|
+        { type: type, unused_count: count }
+      end)
+    end
+    return if unreserved_instances.empty?
+
+    puts 'Unreserved Instances:'
+    puts Hirb::Helpers::Table.render(unreserved_instances.map do |type, count|
+      { type: type, unreserved_count: count }
+    end)
   end
 
   # Lists all EC2 volumes (optional filters them by tags).
@@ -261,9 +320,13 @@ class AwsStorage
   # @param bucket_name [String] The name of the S3 bucket.
   # @param options [Hash] Additional options for the AWS S3 client (region,credentials, etc.)
   def initialize(bucket_name, **options)
+    @logger = Logger.new(options.delete(:log_file) || $stdout)
+    @logger.level = options.delete(:log_level) || Logger::WARN
+    puts "Logger level set to #{@logger.level}" if @logger.level != Logger::WARN
+
     @bucket_name = bucket_name
     @client = Aws::S3::Client.new(**options)
-    puts "Using AWS region: #{@client.config.region}" if @client.config.region
+    puts "AwsStorage: Using region: #{Rainbow(@client.config.region).orange}" if @client.config.region
     select_bucket(bucket_name)
   end
 
@@ -601,14 +664,34 @@ def run_with_args(args)
       opts.on('--stop', 'Stop EC2 instances') do
         options[:stop] = true
       end
+      opts.on('--reservations', 'List EC2 reservations and unreserved instances') do
+        options[:reservations] = true
+      end
+
     when 'help', '-h', '--help'
       puts opts
       exit
     end
 
     if valid_command
+      opts.on('--debug', 'Enable debug logging') do
+        options[:log_level] = Logger::DEBUG
+      end
+      opts.on('--info', 'Enable info logging') do
+        options[:log_level] = Logger::INFO
+      end
+      opts.on('--log-file FILE', 'Log output to a file instead of stdout') do |log_file|
+        options[:log_file] = log_file
+      end
       opts.on('--region REGION', 'AWS region to use (default is env var AWS_REGION or ~/.aws/config settings)') do |region|
         options[:region] = region
+      end
+      opts.on('--config CONFIG_FILE', 'Specify to load config.yml for multiple region support') do |config_file|
+        if command != 's3'
+          options[:config_file] = config_file
+        else
+          puts "#{Rainbow('WARNING').yellow} Config file option is not supported for S3 command."
+        end
       end
       if command != 'cost'
         opts.on('--dry-run', 'Perform a dry run (no changes will be made)') do
@@ -630,6 +713,12 @@ def run_with_args(args)
 
   return unless valid_command
 
+  config = if options[:config_file]
+             YAML.load_file(options[:config_file])
+           else
+             { 'regions' => [options[:region]] }
+           end
+
   case command
   when 's3'
     if options[:bucket].nil?
@@ -637,9 +726,9 @@ def run_with_args(args)
       return
     end
     s = if options[:region]
-          AwsStorage.new(options[:bucket], region: options[:region])
+          AwsStorage.new(options[:bucket], region: options[:region], log_level: options[:log_level], log_file: options[:log_file])
         else
-          AwsStorage.new(options[:bucket])
+          AwsStorage.new(options[:bucket], log_level: options[:log_level], log_file: options[:log_file])
         end
     # Now you can use the options hash to determine what to do
     if options[:list]
@@ -653,36 +742,42 @@ def run_with_args(args)
       s.delete_many(options[:delete], dry_run: options[:dry_run])
     end
   when 'ec2'
-    aws = if options[:region]
-            AwsTasks.new(region: options[:region])
-          else
-            AwsTasks.new
-          end
-    if options[:add_tags]
-      aws.add_tags(options[:add_tags], options[:tags], dry_run: options[:dry_run])
-    elsif options[:volumes]
-      aws.list_volumes(options[:tags])
-      if !options[:tags].empty? && (options[:volume_type] || options[:iops])
-        aws.modify_volumes(
-          volume_type: options[:volume_type],
-          iops: options[:iops],
-          dry_run: options[:dry_run]
-        )
+    config['regions'].each do |region|
+      aws = if region
+              AwsTasks.new(region: region, log_level: options[:log_level], log_file: options[:log_file])
+            else
+              AwsTasks.new(log_level: options[:log_level], log_file: options[:log_file])
+            end
+      if options[:add_tags]
+        aws.add_tags(options[:add_tags], options[:tags], dry_run: options[:dry_run])
+      elsif options[:volumes]
+        aws.list_volumes(options[:tags])
+        if !options[:tags].empty? && (options[:volume_type] || options[:iops])
+          aws.modify_volumes(
+            volume_type: options[:volume_type],
+            iops: options[:iops],
+            dry_run: options[:dry_run]
+          )
+        end
+        aws.list_add_tags(options[:list_add_tags], dry_run: options[:dry_run]) unless options[:list_add_tags].empty?
+      elsif options[:reservations]
+        aws.list_reservations
+      else
+        aws.list_instances(options[:tags])
+        aws.start_instances(dry_run: options[:dry_run]) if options[:start] && !options[:tags].empty?
+        aws.stop_instances(dry_run: options[:dry_run]) if options[:stop] && !options[:tags].empty?
+        aws.list_add_tags(options[:list_add_tags], dry_run: options[:dry_run]) unless options[:list_add_tags].empty?
       end
-      aws.list_add_tags(options[:list_add_tags], dry_run: options[:dry_run]) unless options[:list_add_tags].empty?
-    else
-      aws.list_instances(options[:tags])
-      aws.start_instances(dry_run: options[:dry_run]) if options[:start] && !options[:tags].empty?
-      aws.stop_instances(dry_run: options[:dry_run]) if options[:stop] && !options[:tags].empty?
-      aws.list_add_tags(options[:list_add_tags], dry_run: options[:dry_run]) unless options[:list_add_tags].empty?
     end
   when 'cost'
-    aws = if options[:region]
-            AwsTasks.new(region: options[:region])
-          else
-            AwsTasks.new
-          end
-    aws.cost_report
+    config['regions'].each do |region|
+      aws = if region
+              AwsTasks.new(region: region, log_level: options[:log_level], log_file: options[:log_file])
+            else
+              AwsTasks.new(log_level: options[:log_level], log_file: options[:log_file])
+            end
+      aws.cost_report
+    end
   end
 end
 
