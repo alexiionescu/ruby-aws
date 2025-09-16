@@ -36,7 +36,6 @@ class AwsTasks
     @client = Aws::EC2::Client.new(**options)
     @ec2_resource = Aws::EC2::Resource.new(client: @client)
     @ce = Aws::CostExplorer::Client.new(**options)
-    puts "AwsTasks: Using region: #{Rainbow(@client.config.region).orange}" if @client.config.region
   end
 
   # Filters the response based on the provided tags.
@@ -267,8 +266,9 @@ class AwsTasks
     modified_count
   end
 
-  def cost_report(regions: [])
+  def cost_report(regions)
     regions = [@ce.config.region] if regions.empty?
+    @logger.info("Generating cost report for regions: #{regions.join(', ')}")
     response = @ce.get_cost_and_usage(
       time_period: {
         start: (Date.today - 30).strftime('%Y-%m-%d'),
@@ -326,7 +326,6 @@ class AwsStorage
 
     @bucket_name = bucket_name
     @client = Aws::S3::Client.new(**options)
-    puts "AwsStorage: Using region: #{Rainbow(@client.config.region).orange}" if @client.config.region
     select_bucket(bucket_name)
   end
 
@@ -770,13 +769,12 @@ def run_with_args(args)
       end
     end
   when 'cost'
-    config['regions'].each do |region|
-      aws = if region
-              AwsTasks.new(region: region, log_level: options[:log_level], log_file: options[:log_file])
-            else
-              AwsTasks.new(log_level: options[:log_level], log_file: options[:log_file])
-            end
-      aws.cost_report
+    aws = AwsTasks.new(log_level: options[:log_level], log_file: options[:log_file])
+    if config['regions'] && config['regions'].count > 1
+      aws.cost_report(config['regions'])
+    else
+      aws = AwsTasks.new(log_level: options[:log_level], log_file: options[:log_file])
+      aws.cost_report([options[:region]].compact)
     end
   end
 end
